@@ -93,6 +93,8 @@ func defaultOutputUID() -> String? {
 
 // MARK: - pan (window position)
 /// パンの強調倍率(1.0で画面位置そのまま、大きいほど極端に振れる)
+/// システム音の初期位置(-1=左 ... 0=中央 ... +1=右)。ウィンドウ位置から求めたパンに足す
+var panOffset: Float = max(-1, min(1, Float(UserDefaults.standard.double(forKey: "panOffset"))))
 var panGain: CGFloat = {
     let v = UserDefaults.standard.double(forKey: "panGain")
     return v > 0 ? CGFloat(v) : 2.0
@@ -312,7 +314,8 @@ func updatePan() {
     if pan == nil, let app = NSWorkspace.shared.frontmostApplication {
         pan = panPosition(forPID: app.processIdentifier)
     }
-    if let pan { setPan(sysState, pan) }
+    // 初期位置の分だけずらす(倍率をかけて左右の端に収めた値に足し、もう一度端に収める)
+    if let pan { setPan(sysState, max(-1, min(1, pan + panOffset))) }
 
     // --- アプリの音。タップごとに、そのアプリ自身のウィンドウ位置を基準にする ---
     for (key, e) in appEngines {
@@ -447,6 +450,35 @@ final class TapEngine {
 }
 
 // MARK: - app
+/// メニューバーのアイコン: スピーカーの下に左右の矢印(音のパン)。オフのときはスピーカーに斜線
+func makeStatusIcon(enabled: Bool) -> NSImage {
+    let size = NSSize(width: 20, height: 18)
+    let image = NSImage(size: size, flipped: false) { _ in
+        func draw(_ name: String, _ pointSize: CGFloat, _ weight: NSFont.Weight, centerY: CGFloat) {
+            let cfg = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight)
+            guard let s = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) else { return }
+            let sz = s.size
+            s.draw(in: NSRect(x: (size.width - sz.width) / 2, y: centerY - sz.height / 2, width: sz.width, height: sz.height))
+        }
+        draw(enabled ? "speaker.wave.2.fill" : "speaker.slash.fill", 9, .semibold, centerY: 12.5)
+        // 矢印は、小さくてもつぶれないように、線と塗りの三角で直接描く
+        NSColor.black.setFill()
+        let cy: CGFloat = 3.5
+        NSRect(x: 5, y: cy - 1, width: size.width - 10, height: 2).fill()
+        for (tip, base) in [(CGFloat(1), CGFloat(6.5)), (size.width - 1, size.width - 6.5)] {
+            let t = NSBezierPath()
+            t.move(to: NSPoint(x: tip, y: cy))
+            t.line(to: NSPoint(x: base, y: cy + 3.5))
+            t.line(to: NSPoint(x: base, y: cy - 3.5))
+            t.close()
+            t.fill()
+        }
+        return true
+    }
+    image.isTemplate = true  // メニューバーの明暗に合わせて、自動で色が変わる
+    image.accessibilityDescription = "SystemSoundPan"
+    return image
+}
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let sysEngine = TapEngine(name: "system", state: sysState)
     let watcher = NotificationWatcher()
@@ -454,12 +486,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var enabled = true
     var toggle: NSMenuItem!
     var browserItem: NSMenuItem!
-    var gainItem: NSMenuItem!
+    var gainLabel: NSTextField!
+    var offsetLabel: NSTextField!
     var extraMenu = NSMenu()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "◐"
+        item.button?.image = makeStatusIcon(enabled: true)
         let menu = NSMenu()
         toggle = NSMenuItem(title: "システム音をウィンドウ位置でパン", action: #selector(toggleEnabled), keyEquivalent: "")
         toggle.target = self; toggle.state = .on
@@ -471,16 +504,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         extraItem.submenu = extraMenu
         menu.addItem(extraItem)
         rebuildExtraMenu()
-        gainItem = NSMenuItem(title: "", action: #selector(editGain), keyEquivalent: "")
-        gainItem.target = self
-        updateGainTitle()
-        menu.addItem(gainItem)
+        menu.addItem(makeGainItem())
+        menu.addItem(makeOffsetItem())
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
 
-        Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in updatePan() }
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.reconcile() }
+        // .common に登録して、メニューを開いている間(スライダー操作中)もパンを更新する
+        RunLoop.main.add(Timer(timeInterval: 0.1, repeats: true) { _ in updatePan() }, forMode: .common)
+        RunLoop.main.add(Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.reconcile() }, forMode: .common)
         if debug {
             Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in log("calls=\(sysState.calls) inPeak=\(sysState.inPeak) \(sysState.info)") }
             Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
@@ -501,32 +533,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleEnabled() {
         enabled.toggle()
         toggle.state = enabled ? .on : .off
-        item.button?.title = enabled ? "◐" : "○"
+        item.button?.image = makeStatusIcon(enabled: enabled)
         reconcile()
     }
 
-    func updateGainTitle() { gainItem.title = String(format: "パンの倍率… (現在 %.1f)", Double(panGain)) }
-
-    @objc func editGain() {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "パンの倍率"
-        alert.informativeText = "1.0 = 画面上の位置のとおり / 大きいほど極端に振れます(0.1〜10)。初期値は 2.0 です。"
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
-        field.stringValue = String(format: "%.1f", Double(panGain))
-        alert.accessoryView = field
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "キャンセル")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let text = field.stringValue.replacingOccurrences(of: ",", with: ".").trimmingCharacters(in: .whitespaces)
-        if let v = Double(text), v >= 0.1, v <= 10 {
-            panGain = CGFloat(v)
-            UserDefaults.standard.set(v, forKey: "panGain")
-            updateGainTitle()
-        } else {
-            let e = NSAlert(); e.messageText = "0.1〜10 の数値を入力してください"; e.runModal()
+    /// メニューの中に置くスライダー(見出し、左右の端の文字、目盛り)
+    func makeSliderItem(value: Double, range: ClosedRange<Double>, ticks: Int, ends: (String, String), action: Selector) -> (NSMenuItem, NSTextField) {
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 66))
+        let label = NSTextField(labelWithString: "")
+        label.font = NSFont.menuFont(ofSize: 0)
+        label.frame = NSRect(x: 20, y: 42, width: 250, height: 18)
+        view.addSubview(label)
+        let slider = NSSlider(value: value, minValue: range.lowerBound, maxValue: range.upperBound, target: self, action: action)
+        slider.isContinuous = true
+        slider.sendAction(on: [.leftMouseDown, .leftMouseDragged, .leftMouseUp])  // 離したことも受け取る
+        slider.numberOfTickMarks = ticks
+        slider.allowsTickMarkValuesOnly = false
+        slider.frame = NSRect(x: 36, y: 14, width: 208, height: 26)
+        view.addSubview(slider)
+        for (text, x) in [(ends.0, 17.0), (ends.1, 250.0)] {
+            let l = NSTextField(labelWithString: text)
+            l.font = NSFont.menuFont(ofSize: 11)
+            l.textColor = .secondaryLabelColor
+            l.frame = NSRect(x: x, y: 18, width: 18, height: 16)
+            view.addSubview(l)
         }
+        let m = NSMenuItem()
+        m.view = view
+        return (m, label)
     }
+
+    // パンの倍率のスライダー位置(0〜1)と値の対応。左の1/3が0.1〜1、右の2/3が1〜10(それぞれ対数目盛り)
+    func gainValue(at t: Double) -> Double { t <= 1.0 / 3 ? pow(10, t * 3 - 1) : pow(10, (t - 1.0 / 3) * 1.5) }
+    func gainPosition(of v: Double) -> Double { v <= 1 ? (log10(v) + 1) / 3 : log10(v) / 1.5 + 1.0 / 3 }
+
+    /// パンの倍率(0.1〜10)。左から1/3の目盛りが1.0
+    func makeGainItem() -> NSMenuItem {
+        let (m, label) = makeSliderItem(value: gainPosition(of: Double(panGain)), range: 0...1, ticks: 4, ends: ("弱", "強"), action: #selector(gainChanged(_:)))
+        gainLabel = label
+        updateGainLabel()
+        return m
+    }
+
+    /// システム音の初期位置。中央が0の左右スライダー
+    func makeOffsetItem() -> NSMenuItem {
+        let (m, label) = makeSliderItem(value: Double(panOffset) * 100, range: -100...100, ticks: 3, ends: ("左", "右"), action: #selector(offsetChanged(_:)))
+        offsetLabel = label
+        updateOffsetLabel()
+        return m
+    }
+
+    func updateGainLabel() { gainLabel.stringValue = String(format: "パンの倍率: %.1f", Double(panGain)) }
+
+    func updateOffsetLabel() {
+        let v = Int((panOffset * 100).rounded())
+        let pos = v == 0 ? "中央" : (v < 0 ? "左 \(-v)" : "右 \(v)")
+        offsetLabel.stringValue = "システム音の初期位置: \(pos)"
+    }
+
+    @objc func gainChanged(_ sender: NSSlider) {
+        if abs(sender.doubleValue - 1.0 / 3) <= 0.015 { sender.doubleValue = 1.0 / 3 }  // 1.0の目盛り付近は吸い付ける
+        let v = max(0.1, min(10, (gainValue(at: sender.doubleValue) * 10).rounded() / 10))  // 0.1刻み
+        panGain = CGFloat(v)
+        UserDefaults.standard.set(v, forKey: "panGain")
+        updateGainLabel()
+        previewIfReleased()
+    }
+
+    @objc func offsetChanged(_ sender: NSSlider) {
+        var v = sender.doubleValue.rounded()
+        if abs(v) <= 4 { v = 0; sender.doubleValue = 0 }  // 中央付近は0に吸い付ける
+        panOffset = Float(v / 100)
+        UserDefaults.standard.set(v / 100, forKey: "panOffset")
+        updateOffsetLabel()
+        previewIfReleased()
+    }
+
+    /// マウスを離したら、今の位置を確かめられるように、システム通知音を1回鳴らす
+    func previewIfReleased() {
+        guard NSApp.currentEvent?.type == .leftMouseUp else { return }
+        sysState.lastSound = CFAbsoluteTimeGetCurrent()  // 省電力の間引きを止めて、すぐにパンを更新する
+        updatePan()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { NSSound.beep() }
+    }
+
+    // ダイアログは、メニューが閉じきってから開く(メニューの処理の中で開くと、画面に出ないまま待ち続けて、固まったようになる)
+    @objc func addExtra() { perform(#selector(showAddExtraPanel), with: nil, afterDelay: 0.2) }
 
     func rebuildExtraMenu() {
         extraMenu.removeAllItems()
@@ -569,9 +661,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         saveExtraApps(); rebuildExtraMenu(); reconcile()
     }
 
-    @objc func addExtra() {
+    @objc func showAddExtraPanel() {
+        if NSApp.modalWindow != nil { NSApp.activate(ignoringOtherApps: true); return }
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
+        panel.level = .floating
+        panel.collectionBehavior.insert(.moveToActiveSpace)
         panel.message = "パンの対象にするアプリを選んでください"
         panel.allowedContentTypes = [.application]
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
