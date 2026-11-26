@@ -121,6 +121,7 @@ Classic Mac OS(System 7〜Mac OS 9)では、ステレオ対応機でシステム
 | `SystemSoundPan.app/Contents/MacOS/SystemSoundPan` | アプリの実行ファイル(Apple Silicon用)です。`main.swift` をビルドしたものです |
 | `SystemSoundPan.app/Contents/Info.plist` | アプリの設定ファイルです。アプリ名、メニューバー常駐(Dockに出さない)の指定、オーディオ録音の許可ダイアログに表示する説明文が入っています |
 | `SystemSoundPan.app/Contents/_CodeSignature/` | 簡易署名(ad-hoc)の情報です。Apple Developer IDの署名ではありません |
+| `AppIcon.icns` | アプリのアイコン画像です。ビルドするときに、アプリに組み込みます |
 | `main.swift` | ソースコードのすべてです。システム音の取得、ウィンドウ位置からのパン計算、再生、メニューバー表示が入っています |
 | `build.sh` | ビルド用スクリプトです。`main.swift` から `SystemSoundPan.app` を作り、署名します(Xcodeのコマンドラインツールが必要です) |
 | `README.md` | このファイルです |
