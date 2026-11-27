@@ -125,18 +125,19 @@ func cachedBundleID(_ pid: pid_t) -> String? {
 }
 
 /// ウィンドウ1枚ぶんの、必要な情報だけ(辞書のままだと、走査のたびに変換が入って重いので、取得時に1回だけ変換する)
-struct Win { var pid: Int32; var num: Int; var x: CGFloat; var width: CGFloat; var height: CGFloat; var alpha: Double }
+struct Win { var pid: Int32; var num: Int; var x: CGFloat; var width: CGFloat; var height: CGFloat; var alpha: Double; var layer: Int }
 
 func parseWindows(_ infos: [[String: Any]]) -> [Win] {
     var out: [Win] = []
     out.reserveCapacity(infos.count)
     for w in infos {
-        guard (w[kCGWindowLayer as String] as? Int) == 0,
+        // 通常のウィンドウ(0)と、前面に浮かぶウィンドウ(3。Zoomの設定画面など)だけを読む
+        guard let layer = w[kCGWindowLayer as String] as? Int, layer == 0 || layer == 3,
               let pid = w[kCGWindowOwnerPID as String] as? Int32,
               let bd = w[kCGWindowBounds as String] as? [String: CGFloat],
               let x = bd["X"], let width = bd["Width"], let h = bd["Height"] else { continue }
         out.append(Win(pid: pid, num: (w[kCGWindowNumber as String] as? Int) ?? 0, x: x, width: width, height: h,
-                       alpha: (w[kCGWindowAlpha as String] as? Double) ?? 1))
+                       alpha: (w[kCGWindowAlpha as String] as? Double) ?? 1, layer: layer))
     }
     return out
 }
@@ -144,6 +145,9 @@ func parseWindows(_ infos: [[String: Any]]) -> [Win] {
 /// いま表示されているウィンドウ(前面から順)。1回のパン更新につき1回だけ取得して、使い回す
 var windows: [Win] = []
 var lastWindowX: [Int: CGFloat] = [:]
+/// ウィンドウ番号ごとの、最初に画面上で見た時刻。起動前からあるウィンドウは0(時刻が分からない)
+var firstShown: [Int: CFAbsoluteTime] = [:]
+var firstShownSeeded = false
 /// 全ディスプレイを並べた範囲(取得のたびに更新)
 var screenMinX: CGFloat = 0, screenMaxX: CGFloat = 1
 /// デスクトップ(Space)の切り替えなどでウィンドウが一斉に動いている間は、この時刻までパンを動かさない
@@ -155,8 +159,16 @@ func refreshWindows() {
     if let mn = screens.map({ $0.frame.minX }).min(), let mx = screens.map({ $0.frame.maxX }).max() { screenMinX = mn; screenMaxX = mx }
     let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     windows = parseWindows((CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]) ?? [])
+    // 起動時点であるウィンドウ(非表示・他のデスクトップを含む)は、後で現れても「新しい」と数えない
+    if !firstShownSeeded {
+        firstShownSeeded = true
+        refreshAllWindows()
+        for w in allWindows + windows { firstShown[w.num] = 0 }
+    }
+    let shownAt = CFAbsoluteTimeGetCurrent()
+    for w in windows where firstShown[w.num] == nil { firstShown[w.num] = shownAt }
     var xs: [Int: CGFloat] = [:]
-    for w in windows { xs[w.num] = w.x }
+    for w in windows where w.layer == 0 { xs[w.num] = w.x }
     if !lastWindowX.isEmpty {
         var moved = 0, appeared = 0
         for (k, x) in xs { if let o = lastWindowX[k] { if abs(o - x) > 20 { moved += 1 } } else { appeared += 1 } }
@@ -182,7 +194,8 @@ func panPosition(forPID pid: pid_t) -> Float? { panPosition(matching: { $0 == pi
 /// 条件に合うプロセスの、最前面の通常ウィンドウの位置(-1...1)。いま表示されているウィンドウだけが対象
 func panPosition(matching match: (pid_t) -> Bool) -> Float? {
     // 前面から順に並んでいるので、そのアプリの最初の通常ウィンドウを使う
-    for w in windows where w.width > 50 && match(w.pid) { return panValue(x: w.x, width: w.width) }
+    // 吹き出しや小さなボタンなどの補助ウィンドウは、位置の基準にしない(Zoomでは、マウスを動かすと小窓が出る)
+    for w in windows where w.layer == 0 && w.width >= 160 && w.height >= 100 && w.alpha > 0 && match(w.pid) { return panValue(x: w.x, width: w.width) }
     return nil
 }
 
@@ -199,19 +212,62 @@ func logPan(_ key: String, _ v: Float, _ src: String) {
 var allWindows: [Win] = []
 var allWindowsFetchedAt: CFAbsoluteTime = 0
 
+/// すべてのウィンドウの一覧を、3秒以上たっていたら取得し直す
+func refreshAllWindows() {
+    let now = CFAbsoluteTimeGetCurrent()
+    if now - allWindowsFetchedAt <= 3.0 { return }
+    allWindows = parseWindows((CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]]) ?? [])
+    allWindowsFetchedAt = now
+    // 閉じて破棄されたウィンドウの記録は捨てる
+    if firstShown.count > 2000 {
+        let alive = Set(allWindows.map { $0.num })
+        firstShown = firstShown.filter { alive.contains($0.key) }
+    }
+}
+
+/// 追加したアプリごとの、直前に基準にしたウィンドウ番号
+var chosenWindow: [String: Int] = [:]
+
+/// 追加したアプリ(会議アプリなど)の、基準にするウィンドウの位置(-1...1)。
+/// 1. そのアプリのいちばん大きいウィンドウの4分の1に満たないものは、小窓とみなして除く
+/// 2. 残った表示中のウィンドウのうち、前面に浮かぶもの(設定画面など)があれば、それを優先する。
+///    次に、最後に現れたものを選ぶ。起動前からあるもの同士は、大きいものを選ぶ
+///    (Zoomは会議用のウィンドウを先に作っておくので、番号の順は当てにならない)
+/// 3. 表示中のものがなければ、直前に基準にしたウィンドウ、それもなければ、いちばん大きいウィンドウを使う
+func panPositionForApp(_ key: String, matching match: (pid_t) -> Bool) -> Float? {
+    refreshAllWindows()
+    func area(_ w: Win) -> CGFloat { w.width * w.height }
+    func usable(_ w: Win) -> Bool {
+        w.width >= 160 && w.height >= 100 && w.alpha > 0.1
+            && w.x + w.width / 2 >= screenMinX && w.x + w.width / 2 <= screenMaxX && match(w.pid)
+    }
+    let onscreen = windows.filter(usable)
+    let all = allWindows.filter { usable($0) && $0.width > 300 && $0.height > 200 }
+    let largest = (onscreen + all).map(area).max() ?? 0
+    let newest = onscreen.filter { area($0) >= largest / 4 }.max { a, b in
+        (a.layer, firstShown[a.num] ?? 0, area(a), a.num) < (b.layer, firstShown[b.num] ?? 0, area(b), b.num)
+    }
+    var pick = newest
+    lastPanSource = "onscreen"
+    if pick == nil {
+        lastPanSource = "anyspace"
+        pick = all.first { $0.num == chosenWindow[key] } ?? all.max { area($0) < area($1) }
+    }
+    guard let w = pick else { return nil }
+    if chosenWindow[key] != w.num { log("window[\(key)]=#\(w.num) \(Int(w.width))x\(Int(w.height)) src=\(lastPanSource)") }
+    chosenWindow[key] = w.num
+    return panValue(x: w.x, width: w.width)
+}
+
 /// 条件に合うプロセスのウィンドウの位置(-1...1)。いま表示されているウィンドウを優先し、
 /// なければ、他のデスクトップにあるウィンドウのうち、いちばん大きいものを使う
 /// (切り替えたデスクトップに、音を鳴らしているアプリのウィンドウがなくても、そのアプリの位置から鳴らすため)
 func panPositionAnySpace(matching match: (pid_t) -> Bool) -> Float? {
     if let p = panPosition(matching: match) { lastPanSource = "onscreen"; return p }
     lastPanSource = "anyspace"
-    let now = CFAbsoluteTimeGetCurrent()
-    if now - allWindowsFetchedAt > 3.0 {
-        allWindows = parseWindows((CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]]) ?? [])
-        allWindowsFetchedAt = now
-    }
+    refreshAllWindows()
     var best: Win?
-    for w in allWindows where w.width > 300 && w.height > 200 && w.alpha > 0 {
+    for w in allWindows where w.layer == 0 && w.width > 300 && w.height > 200 && w.alpha > 0 {
         guard w.x + w.width / 2 >= screenMinX, w.x + w.width / 2 <= screenMaxX else { continue }  // 画面の外にある補助ウィンドウは除く
         if best == nil || w.width * w.height > best!.width * best!.height, match(w.pid) { best = w }
     }
@@ -327,7 +383,7 @@ func updatePan() {
             })
         } else {
             let appID = String(key.dropFirst(4))
-            apan = panPositionAnySpace(matching: { pid in
+            apan = panPositionForApp(key, matching: { pid in
                 guard let id = cachedBundleID(pid) else { return false }
                 return id == appID || id.hasPrefix(appID + ".")
             })
